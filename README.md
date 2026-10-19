@@ -2,7 +2,7 @@
 
 **Bypassing Cloudflare Turnstile at Scale via Raw Chrome DevTools Protocol (No `Runtime.enable`), Headed `Xvfb` Chrome, and Split-Lane Token Extraction**
 
-A step-by-step technical breakdown and 100% Python standard-library reference implementation explaining why standard browser automation frameworks (Playwright, Puppeteer, Selenium) fail modern Cloudflare Turnstile challenges—and how to build a fast, deterministic solver on Linux servers.
+A step-by-step technical breakdown and 100% Python standard-library reference implementation explaining why standard browser automation frameworks (Playwright, Puppeteer, Selenium) fail modern Cloudflare Turnstile challenges—and how to build a fast, deterministic solver and end-to-end registration pipeline on Linux servers.
 
 ---
 
@@ -16,7 +16,8 @@ A step-by-step technical breakdown and 100% Python standard-library reference im
    - [Step 2: Zero-Dependency Raw CDP Client (Without `Runtime.enable`)](#step-2-zero-dependency-raw-cdp-client-without-runtimeenable)
    - [Step 3: Closed Shadow DOM Clicking & Pre-Submit Promise Unblocking](#step-3-closed-shadow-dom-clicking--pre-submit-promise-unblocking)
    - [Step 4: Split-Lane Token Extraction (Fast Direct Turnstile + Rotating Proxy POST)](#step-4-split-lane-token-extraction-fast-direct-turnstile--rotating-proxy-post)
-5. [Repository Structure & Running the Examples](#5-repository-structure--running-the-examples)
+5. [Case Study: End-to-End IteraCompute (`qwen/qwen3.8-27b`) Account & API Key Pipeline](#5-case-study-end-to-end-iteracompute-qwenqwen38-27b-account--api-key-pipeline)
+6. [Repository Structure & Running the Examples](#6-repository-structure--running-the-examples)
 
 ---
 
@@ -74,12 +75,17 @@ flowchart LR
     subgraph Direct["1. Fast Direct Lane (Server 10Gbps)"]
         A["Xvfb :display + google-chrome-stable"] --> B["Raw WebSocket CDP (No Runtime.enable)"]
         B --> C["Turnstile Auto-Solves (~3s)"]
-        C --> D["Hook window.fetch & Capture turnstile_token"]
+        C --> D["Click Decline & Hook window.fetch"]
     end
 
     subgraph Proxy["2. Rotating Proxy Lane (<1KB HTTP)"]
-        D --> E["Python urllib POST /register (900B JSON)"]
+        D --> E["POST /api/control/v1/auth/register (900B JSON)"]
         E --> F["Rotating Residential Proxy"]
+    end
+
+    subgraph FastHTTP["3. Post-Signup Direct HTTP Lane"]
+        F --> G["Poll Cloudflare D1 Email -> verify-email"]
+        G --> H["POST /login (CSRF Cookie) -> POST /api-keys"]
     end
 ```
 
@@ -116,80 +122,86 @@ def cdp_eval(sock, msg_id: int, expr: str, await_promise: bool = False):
     while True:
         msg = ws_recv(sock)
         if msg.get("id") == msg_id:
-            return msg.get("result", {}).get("result", {}).get("value")
+            return msg.get("result", {}).get("value")
 ```
 
 ### Step 3: Closed Shadow DOM Clicking & Pre-Submit Promise Unblocking
 
 1. **Closed Shadow DOM Fallback Click:**
-   Turnstile mounts its `<iframe>` inside a **Closed Shadow Root** (`#shadow-root (closed)`), so `document.querySelector('iframe')` from the main page will not see it. If Turnstile asks for a checkbox click instead of auto-solving, locate the host container relative to the submit button (`btn.previousElementSibling.getBoundingClientRect()`) and dispatch a native mouse click at `(box.x + 28, box.y + box.height / 2)`:
-   ```python
-   for ev in ("mouseMoved", "mousePressed", "mouseReleased"):
-       cdp_call(sock, msg_id, "Input.dispatchMouseEvent", {
-           "type": ev,
-           "x": box["x"] + 28,
-           "y": box["y"] + box["h"] / 2,
-           "button": "left" if ev != "mouseMoved" else "none",
-           "clickCount": 1 if ev != "mouseMoved" else 0,
-       })
+   Turnstile mounts its `<iframe>` inside a **Closed Shadow Root** (`#shadow-root (closed)`), so `document.querySelector('iframe')` from the main page will not see it. If Turnstile asks for a checkbox click instead of auto-solving, locate the host container relative to the submit button (`btn.previousElementSibling.getBoundingClientRect()`) and dispatch a native mouse click at `(box.x + 28, box.y + box.height / 2)`.
+2. **Unblocking Pre-Submit Consent Gates (`window.iteraAttribution.ready`):**
+   Inspecting the Next.js bundle (`3a94higtmowq0.js`) reveals a subtle pre-submit gate inside `controlPlaneRequest`:
+   ```javascript
+   if ("/v1/auth/register" === path || "/v1/auth/google/start" === path) {
+     let attr = window.iteraAttribution;
+     await attr?.ready;
+   }
    ```
-2. **Unblocking Pre-Submit Consent Gates:**
-   Many React/Next.js frontends gate form submission behind an async consent/attribution promise (e.g., `await window.attribution?.ready`) that only resolves after clicking `Decline` or `Allow` on a lazy-mounted banner. Always dismiss consent banners **immediately before** triggering the form submit.
+   Until the user clicks **`Decline`** or **`Allow`** on the lazy-mounted *"May we record your source?"* modal, `window.iteraAttribution.ready` never resolves and `fetch("/api/control/v1/auth/register")` hangs forever. Clicking `Decline` right before submitting immediately resolves the promise.
 
 ### Step 4: Split-Lane Token Extraction (Fast Direct Turnstile + Rotating Proxy POST)
 
 Running a full Chrome browser through a rotating residential proxy is slow and brittle: loading 10–15 MB of Next.js bundles and Cloudflare WASM blobs over a proxy often triggers `ERR_CONNECTION_RESET` or times out.
 
-At the same time, most backends verifying Turnstile tokens via `https://challenges.cloudflare.com/turnstile/v0/siteverify` only validate `{secret, response: turnstile_token}` and do **not** enforce strict IP binding (since mobile and dual-stack IPv4/IPv6 users frequently change egress IPs between page load and form submission).
+At the same time, most backends verifying Turnstile tokens via `https://challenges.cloudflare.com/turnstile/v0/siteverify` only validate `{secret, response: turnstile_token}` and do **not** enforce strict IP binding.
 
 **The Split-Lane Pattern:**
 1. **Direct Lane (Chrome):** Run Chrome on the server's fast direct connection (no proxy). Wait ~3 seconds for Turnstile to solve (`submitBtn.disabled === false`).
-2. **In-Page `window.fetch` Interception:** Before clicking submit, override `window.fetch` inside the page to capture the outgoing registration JSON payload (containing `turnstile_token`) **without sending the request from the server's IP**:
-   ```javascript
-   window.__capturedPayload = null;
-   window.fetch = async (url, init) => {
-     if (String(url).includes('/auth/register') && init && init.body) {
-       window.__capturedPayload = init.body;
-     }
-     return new Response(JSON.stringify({ status: 'ok' }), {
-       status: 202,
-       headers: { 'content-type': 'application/json' },
-     });
-   };
-   ```
-3. **Proxy Lane (Python `urllib`):** Read `window.__capturedPayload` via `cdp_eval`, terminate Chrome and `Xvfb` immediately, and send the `<1 KB` JSON `POST` through your rotating residential proxy.
-   - If the proxy connection resets before reaching the server (`status == 0`), rotate the proxy and **reuse the exact same `turnstile_token`** (since it was never sent to the server).
+2. **In-Page `window.fetch` Interception:** Before clicking submit, override `window.fetch` inside the page to capture the outgoing registration JSON payload (containing `turnstile_token`) **without sending the request from the server's IP**.
+3. **Proxy Lane (Python `urllib`):** Read `window.__regPayload` via `cdp_eval`, terminate Chrome and `Xvfb` immediately, and send the `<1 KB` JSON `POST` through your rotating residential proxy.
 
 ---
 
-## 5. Repository Structure & Running the Examples
+## 5. Case Study: End-to-End IteraCompute (`qwen/qwen3.8-27b`) Account & API Key Pipeline
+
+[`examples/04_iteracompute_register.py`](./examples/04_iteracompute_register.py) implements the complete end-to-end account creation and API key minting flow for `https://platform.iteracompute.com`:
+
+1. **Turnstile Challenge Discovery (`/api/control/v1/auth/challenge/config`):**
+   - The signup page renders Cloudflare Turnstile (`site_key: 0x4AAAAAAFbST_1ZkXSNwxOb`, `action: "register"`).
+   - Notably, only `/v1/auth/register` requires `turnstile_token`; subsequent endpoints (`/v1/auth/verify-email`, `/v1/auth/login`, `/v1/api-keys`) do not require Turnstile.
+2. **Fast Direct Token Capture (`get_turnstile_payload`):**
+   - Launches `google-chrome-stable` on an isolated `Xvfb` display (`:100`–`:299`).
+   - Waits for `button[type="submit"].disabled === false` (~3 seconds).
+   - Clicks `Decline` on the Privacy Preferences modal so `window.iteraAttribution.ready` resolves.
+   - Hooks `window.fetch`, fills `email` + `password` using React's native `HTMLInputElement.prototype.value` setter, checks `#accepted_terms`, clicks submit, and extracts the 773-byte `turnstile_token`.
+3. **Proxy Registration (`post_register_payload`):**
+   - Sends `POST /api/control/v1/auth/register` (`~900 bytes`) via the rotating proxy (`ITERA_FALLBACK_PROXY`).
+   - If the proxy is asleep (`status == 0`), calls `VN_PROXY_ROTATE_URL` to wake/rotate it and **reuses the same `turnstile_token`**.
+   - If the current proxy IP hits HTTP `429`, rotates the proxy IP and mints a fresh token.
+4. **Cloudflare D1 Email Verification & API Key Minting (`SessionClient`):**
+   - Polls Cloudflare D1 (`messages` table populated by a Cloudflare Email Worker catch-all) for `https://platform.iteracompute.com/verify-email?token=...`.
+   - Calls `POST /api/control/v1/auth/verify-email` with `{"token": token}`.
+   - Calls `POST /api/control/v1/auth/login` and automatically forwards the `__Host-iteracompute_csrf` cookie into the `X-CSRF-Token` request header.
+   - Calls `POST /api/control/v1/api-keys` with an `Idempotency-Key` UUID header to mint the `sk-...` API key and appends the record to `keys.jsonl`.
+
+---
+
+## 6. Repository Structure & Running the Examples
 
 ```text
 .
 ├── README.md
 ├── LICENSE
 └── examples/
+    ├── .env.example                # Environment template (Cloudflare D1 + Rotating Proxy)
     ├── 01_raw_cdp_client.py        # Minimal zero-dependency WebSocket + CDP client
     ├── 02_xvfb_turnstile_solver.py # Headed Chrome + Xvfb Turnstile solver & screenshot tool
-    └── 03_hybrid_split_lane.py     # Full Split-Lane pattern (direct Turnstile + proxy POST)
+    ├── 03_hybrid_split_lane.py     # Generic Split-Lane pattern (direct Turnstile + proxy POST)
+    ├── 04_iteracompute_register.py # End-to-End IteraCompute signup + D1 verify + API key minting
+    └── 05_farm_loop.sh             # Multi-domain loop wrapper with exponential backoff
 ```
 
 ### Quick Start
 
 ```bash
-# 1. Test raw CDP evaluation without Runtime.enable
-python3 examples/01_raw_cdp_client.py --url "https://example.com"
+# 1. Configure environment variables for Cloudflare D1 & optional proxy rotation
+cp examples/.env.example examples/.env
 
-# 2. Solve Turnstile on a target signup page and save a verification screenshot
-python3 examples/02_xvfb_turnstile_solver.py \
-  --url "https://your-target.example.com/sign-up" \
-  --screenshot /tmp/turnstile_solved.png
+# 2. Register a single account and mint an API key into keys.jsonl
+python3 examples/04_iteracompute_register.py --domain your-catchall-domain.com
 
-# 3. Run the Split-Lane pattern (Direct Chrome token capture -> Rotating Proxy POST)
-python3 examples/03_hybrid_split_lane.py \
-  --signup-url "https://your-target.example.com/sign-up" \
-  --register-api "https://your-target.example.com/api/v1/auth/register" \
-  --proxy "http://127.0.0.1:8080"
+# 3. Run the continuous multi-domain loop (default TARGET=500 accounts)
+TARGET=500 bash examples/05_farm_loop.sh
 ```
 
 ---
